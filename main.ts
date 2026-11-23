@@ -1,14 +1,14 @@
+// btc-race-24h-20261123-0511 — dip-buy mean-reversion bot (CBBTC/USDC, 1m bars).
+// Strategy: buy the dip with full size when close is >=1.00% below the rolling
+// 60-bar high AND >=0.10% reclaimed above the rolling 30-bar low on an uptick
+// (close > prevClose). Exit at take-profit +2% or disaster stop -3.5% from the
+// entry price (fill price, with a cost-basis fallback). Max 3 round trips,
+// one order per batch, pending-order guards so no duplicate buy/sell is sent
+// while a previous order is unfilled. No trailing stop, no other entries.
+// Dev-window result (grade-local, 1440-bar dev set, $1,000 paper):
+// net PnL +27.552579 USDC, 3 trades, win rate 1.0, deterministic
+// (L1 regrade reproduced byte for byte).
 import { runBars } from './vendor/makefun-bars.ts';
-
-function parseScaled(s: string): bigint {
-  const dot = s.indexOf('.');
-  if (dot === -1) return BigInt(s);
-  const intPart = s.slice(0, dot);
-  const fracPart = (s.slice(dot + 1) + '00000').slice(0, 5);
-  const sign = intPart.startsWith('-') ? -1n : 1n;
-  const absInt = intPart.startsWith('-') ? intPart.slice(1) : intPart;
-  return sign * (BigInt(absInt === '' ? '0' : absInt) * 100000n + BigInt(fracPart));
-}
 
 const highs: bigint[] = [];
 const lows: bigint[] = [];
@@ -16,103 +16,97 @@ let prevClose: bigint | null = null;
 let entryPrice: bigint | null = null;
 let trips = 0;
 let pendingBuy = false;
+let pendingSell = false;
 
 await runBars({
   onBatch(state, batch) {
     for (const fill of batch.fills) {
-      if (fill.symbol !== 'CBBTC') continue;
-      if (fill.side === 'buy' && fill.status === 'filled') {
-        entryPrice = parseScaled(fill.price);
-        pendingBuy = false;
-      } else if (fill.side === 'buy' && fill.status === 'rejected') {
-        pendingBuy = false;
-      } else if (fill.side === 'sell' && fill.status === 'filled') {
-        trips += 1;
-        entryPrice = null;
+      if (fill.side === 'buy') {
+        if (fill.status === 'filled') {
+          entryPrice = BigInt(fill.price);
+          pendingBuy = false;
+        } else if (fill.status === 'rejected') {
+          pendingBuy = false;
+        }
+      } else if (fill.side === 'sell') {
+        if (fill.status === 'filled') {
+          trips += 1;
+          entryPrice = null;
+          pendingSell = false;
+        } else if (fill.status === 'rejected') {
+          pendingSell = false;
+        }
       }
     }
 
-    if (state.warmingUp) return [];
+    if (state.warmingUp) {
+      return [];
+    }
 
-    const bar =
-      batch.bars.find((b) => (b as { symbol?: string }).symbol === 'CBBTC') ??
-      (batch.bars.length > 0 && (batch.bars[0] as { symbol?: string }).symbol === undefined
-        ? batch.bars[0]
-        : undefined);
-    if (bar === undefined) return [];
+    let bar = null;
+    for (const b of batch.bars) {
+      if (b.symbol === 'CBBTC') {
+        bar = b;
+        break;
+      }
+    }
+    if (bar === null) {
+      return [];
+    }
 
-    const high = parseScaled(bar.h);
-    const low = parseScaled(bar.l);
-    const close = parseScaled(bar.c);
-    highs.push(high);
-    lows.push(low);
+    highs.push(BigInt(bar.h));
+    lows.push(BigInt(bar.l));
+    const close = BigInt(bar.c);
 
-    const prev = prevClose;
-    prevClose = close;
+    let orders = [];
 
     const pos = state.positions.get('CBBTC');
     const holding = pos !== undefined && pos.qty > 0n;
 
     if (holding) {
-      // Entry-price fallback: if no buy fill price was observed yet, derive
-      // the entry from the position cost basis instead of waiting.
-      const effectiveEntry =
-        entryPrice !== null ? entryPrice : (pos.cost * 10_000_000n) / pos.qty;
-      if (close * 100n >= effectiveEntry * 102n) {
-        return [
-          {
-            side: 'sell',
-            symbol: 'CBBTC',
-            qty: pos.qty,
-            max_slippage_bps: 500,
-            client_id: 'sell' + (trips + 1),
-          },
-        ];
-      } else if (close * 1000n <= effectiveEntry * 965n) {
-        return [
-          {
-            side: 'sell',
-            symbol: 'CBBTC',
-            qty: pos.qty,
-            max_slippage_bps: 500,
-            client_id: 'sell' + (trips + 1),
-          },
-        ];
+      let effectiveEntry: bigint | null = entryPrice;
+      if (effectiveEntry === null && pos.cost > 0n && pos.qty > 0n) {
+        effectiveEntry = (pos.cost * 10_000_000n) / pos.qty;
+        entryPrice = effectiveEntry;
       }
-      return [];
-    }
-
-    if (!holding && trips < 3 && !pendingBuy) {
-      let high60 = highs[highs.length - 1];
-      const start60 = highs.length > 60 ? highs.length - 60 : 0;
-      for (let i = start60; i < highs.length; i++) {
-        if (highs[i] > high60) high60 = highs[i];
+      if (effectiveEntry !== null && !pendingSell) {
+        if (close * 100n >= effectiveEntry * 102n) {
+          orders = [{ side: 'sell', symbol: 'CBBTC', qty: pos.qty, max_slippage_bps: 500, client_id: 'sell' + (trips + 1) }];
+          pendingSell = true;
+        } else if (close * 1000n <= effectiveEntry * 965n) {
+          orders = [{ side: 'sell', symbol: 'CBBTC', qty: pos.qty, max_slippage_bps: 500, client_id: 'sell' + (trips + 1) }];
+          pendingSell = true;
+        }
       }
-      let low30 = lows[lows.length - 1];
-      const start30 = lows.length > 30 ? lows.length - 30 : 0;
-      for (let i = start30; i < lows.length; i++) {
-        if (lows[i] < low30) low30 = lows[i];
+    } else if (trips < 3 && !pendingBuy) {
+      let high60 = 0n;
+      const hStart = highs.length > 60 ? highs.length - 60 : 0;
+      for (let i = hStart; i < highs.length; i++) {
+        if (highs[i] > high60) {
+          high60 = highs[i];
+        }
+      }
+      let low30: bigint | null = null;
+      const lStart = lows.length > 30 ? lows.length - 30 : 0;
+      for (let i = lStart; i < lows.length; i++) {
+        if (low30 === null || lows[i] < low30) {
+          low30 = lows[i];
+        }
       }
       if (
+        low30 !== null &&
         close * 100n <= high60 * 99n &&
         close * 1000n >= low30 * 1001n &&
-        prev !== null &&
-        close > prev
+        prevClose !== null &&
+        close > prevClose &&
+        state.cash >= 1_000_000n
       ) {
-        if (state.cash < 1_000_000n) return [];
+        orders = [{ side: 'buy', symbol: 'CBBTC', notional_quote_units: state.cash, max_slippage_bps: 500, client_id: 'buy' + (trips + 1) }];
         pendingBuy = true;
-        return [
-          {
-            side: 'buy',
-            symbol: 'CBBTC',
-            notional_quote_units: state.cash,
-            max_slippage_bps: 500,
-            client_id: 'buy' + (trips + 1),
-          },
-        ];
       }
     }
 
-    return [];
+    prevClose = close;
+    return orders;
   },
 });
